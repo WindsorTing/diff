@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 diff_to_pdf.py — Intelligent side-by-side diff of two Python files,
-rendered as a dark-mode PDF, with substantive-change highlighting for
-data-analysis / plotting code.
+rendered as a dark-mode PDF, with substantive-change highlighting and
+a hyperlinked function index for data-analysis / plotting code.
 
 "Intelligent" means the diff is computed with difflib's SequenceMatcher
 over the two full line sequences, so lines that were merely *shifted*
@@ -15,14 +15,22 @@ new file on the right (additions in light green), unchanged lines
 shown on both sides at matching row height, cream text throughout.
 
 Substantive-change highlighting: changed lines (+/-) that match a
-heuristic set of patterns for numerical computation, data
-transformation, or plotting calls (numpy/pandas/scipy/sklearn/
-matplotlib/seaborn/plotly, arithmetic assignments, etc.) get a yellow
-star. Changed lines that look like comments, docstrings, imports,
-prints/logging, or pure renames/formatting are left unstarred — the
-idea is to draw the eye to changes that can affect computed results
-or rendered figures, not framing/cosmetic edits. This is a heuristic,
-not a static analyzer — skim the whole diff, use the stars as a guide.
+heuristic set of patterns for numerical computation, data loading/
+saving, subsetting, or plotting calls get a yellow star. Comments,
+docstrings, imports, prints/logging, and pure renames/formatting are
+left unstarred. This is a heuristic, not a static analyzer — skim
+the whole diff, use the stars as a guide.
+
+Function index: page 1 lists every `def` found in either file, with
+its line number in the old and/or new file, each hyperlinked to that
+exact line further in the document (also mirrored in the PDF's
+bookmark/outline sidebar). `def` lines are never collapsed by
+--context, so the index always resolves to something visible.
+
+Scope annotations: every starred (substantive) line gets a small
+"→ in <function>()" and, if it's a continuation of a multi-line call,
+"call: <name>(…)" note directly beneath it, so you know which
+function/call a significant change belongs to without scrolling.
 
 Usage:
     python diff_to_pdf.py old_file.py new_file.py -o diff_report.pdf
@@ -37,6 +45,7 @@ import difflib
 import math
 import re
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 from reportlab.lib.pagesizes import LETTER, landscape
@@ -56,6 +65,7 @@ DIVIDER_COLOR  = (0.22, 0.22, 0.21)     # center column divider
 TINT_GREEN     = (0.08, 0.14, 0.08)
 TINT_RED       = (0.16, 0.08, 0.08)
 GAP_COLOR      = (0.55, 0.68, 0.85)
+ANNOTATION_COLOR = (0.58, 0.72, 0.88)   # scope/call breadcrumb text
 STAR_YELLOW    = (1.00, 0.84, 0.20)
 STAR_TINT_ADD  = (0.16, 0.16, 0.05)     # extra glow tint for starred lines
 STAR_TINT_DEL  = (0.20, 0.13, 0.05)
@@ -63,6 +73,7 @@ STAR_TINT_DEL  = (0.20, 0.13, 0.05)
 FONT_MONO      = "Courier"
 FONT_MONO_BOLD = "Courier-Bold"
 FONT_SIZE      = 8.3
+ANNOT_SIZE     = 7.1
 LINE_HEIGHT    = 11.4
 
 PAGE_W, PAGE_H = landscape(LETTER)
@@ -149,7 +160,6 @@ _SIGNIFICANT_PATTERNS = [
     # math operator, excluding pure default-arg/decorator/comparison lines
     re.compile(r'^\s*[\w\.\[\]\'\", ]+\s=\s.*[-+*/%^]|^\s*[\w\.\[\]]+\s*[-+*/%]=\s'),
 ]
-# Pre-compile the string patterns; keep the already-compiled one as-is.
 _SIGNIFICANT_RE = [re.compile(p) if isinstance(p, str) else p
                     for p in _SIGNIFICANT_PATTERNS]
 
@@ -157,8 +167,9 @@ _SIGNIFICANT_RE = [re.compile(p) if isinstance(p, str) else p
 def is_significant(line, extra_patterns=None):
     """
     Heuristic: True if this line looks like it performs a calculation on
-    data or produces/configures a plot, as opposed to comments, imports,
-    logging, blank lines, or pure formatting/renames.
+    data, loads/saves/subsets it, or produces/configures a plot, as
+    opposed to comments, imports, logging, blank lines, or pure
+    formatting/renames.
     """
     if not line.strip():
         return False
@@ -173,6 +184,119 @@ def is_significant(line, extra_patterns=None):
             if pat.search(line):
                 return True
     return False
+
+
+# ---------------------------------------------------------------- #
+# Structural analysis — function/class scope tracking, used for both
+# the hyperlinked function index and the inline scope annotations.
+# ---------------------------------------------------------------- #
+_DEF_RE = re.compile(r'^\s*def\s+(\w+)\s*\(')
+_CLASS_RE = re.compile(r'^\s*class\s+(\w+)')
+_CALL_OPEN_RE = re.compile(r'([\w.]+)\s*\(\s*$')
+_CALL_ANY_RE = re.compile(r'([A-Za-z_][\w.]*)\s*\(')
+
+
+def analyze_structure(lines):
+    """
+    Single pass over a file's lines. Returns:
+      scope_map — per-line qualified enclosing function/class.method name
+                  (None outside any def/class)
+      defs      — list of (qualified_name, 1-based lineno) for every
+                  `def` line, in file order
+    """
+    scope_map = []
+    defs = []
+    stack = []  # list of (indent, qualified_name)
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        indent = len(line) - len(line.lstrip(" "))
+        if stripped:
+            while stack and indent <= stack[-1][0]:
+                stack.pop()
+        current = stack[-1][1] if stack else None
+        m = _DEF_RE.match(line)
+        c = _CLASS_RE.match(line)
+        if m:
+            name = m.group(1)
+            qualified = f"{current}.{name}" if current else name
+            scope_map.append(qualified)
+            defs.append((qualified, i + 1))
+            stack.append((indent, qualified))
+        elif c:
+            name = c.group(1)
+            qualified = f"{current}.{name}" if current else name
+            scope_map.append(qualified)
+            stack.append((indent, qualified))
+        else:
+            scope_map.append(current)
+    return scope_map, defs
+
+
+def is_def_line(text):
+    return bool(text) and bool(_DEF_RE.match(text))
+
+
+def find_enclosing_call(lines, idx):
+    """
+    If lines[idx] doesn't itself show a call opening, look back a few
+    lines for the nearest multi-line call header it's likely a
+    continuation of (e.g. a lone keyword-argument line inside a
+    plt.scatter(...) spanning several lines).
+    """
+    line = lines[idx]
+    if _CALL_ANY_RE.search(line):
+        return None
+    for back in range(1, 9):
+        j = idx - back
+        if j < 0:
+            break
+        m = _CALL_OPEN_RE.search(lines[j])
+        if m:
+            return m.group(1)
+        if lines[j].strip() and not lines[j].rstrip().endswith((",", "(", "[", "\\")):
+            break
+    return None
+
+
+def build_annotation(lines, scope_map, lineno):
+    """Breadcrumb for a significant line: enclosing function + (if it's a
+    bare continuation line) the multi-line call it belongs to."""
+    idx = lineno - 1
+    if idx < 0 or idx >= len(lines):
+        return None
+    scope = scope_map[idx] if idx < len(scope_map) else None
+    call = find_enclosing_call(lines, idx)
+    parts = []
+    if scope:
+        parts.append(f"in {scope}()")
+    if call:
+        parts.append(f"call: {call}(\u2026)")
+    return "   \u2022   ".join(parts) if parts else None
+
+
+def build_def_index(old_lines, new_lines, old_defs, new_defs):
+    """Merge old/new `def` occurrences by name into a unified, sorted
+    index for the function table. Duplicate names within one file are
+    paired positionally and labeled (#2), (#3), ... for clarity."""
+    old_map = defaultdict(list)
+    for name, ln in old_defs:
+        old_map[name].append(ln)
+    new_map = defaultdict(list)
+    for name, ln in new_defs:
+        new_map[name].append(ln)
+
+    entries = []
+    for name in sorted(set(old_map) | set(new_map)):
+        olds, news = old_map.get(name, []), new_map.get(name, [])
+        n = max(len(olds), len(news))
+        for i in range(n):
+            label = name if n == 1 else f"{name} (#{i + 1})"
+            entries.append({
+                "label": label,
+                "old_lineno": olds[i] if i < len(olds) else None,
+                "new_lineno": news[i] if i < len(news) else None,
+            })
+    return entries
 
 
 # ---------------------------------------------------------------- #
@@ -225,16 +349,20 @@ def summarize(pairs, extra_patterns=None):
 
 
 # ---------------------------------------------------------------- #
-# Context collapsing (optional)
+# Context collapsing (optional) — `def` lines are always kept so the
+# function index can always link somewhere visible, and so a starred
+# change deep in a function still shows its header nearby.
 # ---------------------------------------------------------------- #
 def apply_context(pairs, context):
     if context is None:
         return pairs
     n = len(pairs)
-    is_change = [p[0] != "equal" for p in pairs]
     keep = [False] * n
-    for i, ch in enumerate(is_change):
-        if ch:
+    for i, p in enumerate(pairs):
+        if p[0] != "equal" or is_def_line(p[2]) or is_def_line(p[5]):
+            keep[i] = True
+    for i in list(range(n)):
+        if pairs[i][0] != "equal":
             for j in range(max(0, i - context), min(n, i + context + 1)):
                 keep[j] = True
     out = []
@@ -252,7 +380,7 @@ def apply_context(pairs, context):
 
 
 # ---------------------------------------------------------------- #
-# Text wrapping
+# Text wrapping / truncation
 # ---------------------------------------------------------------- #
 def wrap_text(text, font, size, max_width):
     if not text:
@@ -292,6 +420,15 @@ def wrap_text(text, font, size, max_width):
     return out
 
 
+def truncate_to_width(text, font, size, max_width):
+    if stringWidth(text, font, size) <= max_width:
+        return text
+    ell = "\u2026"
+    while text and stringWidth(text + ell, font, size) > max_width:
+        text = text[:-1]
+    return (text + ell) if text else ell
+
+
 # ---------------------------------------------------------------- #
 # Small vector star (avoids relying on a Unicode glyph in base14 fonts)
 # ---------------------------------------------------------------- #
@@ -320,7 +457,9 @@ def draw_star(c, cx, cy, outer_r, color):
 # ---------------------------------------------------------------- #
 class SideBySideDiffPDF:
     def __init__(self, path, old_name, new_name, added, removed, unchanged,
-                 substantive, highlight=True):
+                 substantive, old_lines, new_lines, old_scope_map,
+                 new_scope_map, def_entries, highlight=True,
+                 extra_patterns=None):
         self.c = canvas.Canvas(str(path), pagesize=(PAGE_W, PAGE_H))
         self.old_name = old_name
         self.new_name = new_name
@@ -329,16 +468,35 @@ class SideBySideDiffPDF:
         self.unchanged = unchanged
         self.substantive = substantive
         self.highlight = highlight
+        self.old_lines = old_lines
+        self.new_lines = new_lines
+        self.old_scope_map = old_scope_map
+        self.new_scope_map = new_scope_map
+        self.def_entries = def_entries
+        self.extra_patterns = extra_patterns
+        self.old_def_anchor = {e["old_lineno"]: f"defold{i}"
+                                for i, e in enumerate(def_entries) if e["old_lineno"]}
+        self.new_def_anchor = {e["new_lineno"]: f"defnew{i}"
+                                for i, e in enumerate(def_entries) if e["new_lineno"]}
         self.page_num = 0
         self.y = 0
+        self._diff_started = False
+        self._draw_function_index()
         self._new_page()
+
+    # -- page management --------------------------------------------------
+    def _bg_page(self):
+        self.page_num += 1
+        self.c.setFillColorRGB(*BG_COLOR)
+        self.c.rect(0, 0, PAGE_W, PAGE_H, fill=1, stroke=0)
 
     def _new_page(self):
         if self.page_num > 0:
             self.c.showPage()
-        self.page_num += 1
-        self.c.setFillColorRGB(*BG_COLOR)
-        self.c.rect(0, 0, PAGE_W, PAGE_H, fill=1, stroke=0)
+        self._bg_page()
+        if not self._diff_started:
+            self.c.bookmarkPage("diff_top")
+            self._diff_started = True
         self._draw_header()
         self.y = PAGE_H - MARGIN_TOP - 4
 
@@ -386,26 +544,111 @@ class SideBySideDiffPDF:
     def draw_gap(self, count):
         self._ensure_space(1)
         c = self.c
-        label = f"\u22ee  {count} unchanged line(s) hidden"
+        label = f"\u2022 \u2022 \u2022  {count} unchanged line(s) hidden  \u2022 \u2022 \u2022"
         c.setFillColorRGB(*GAP_COLOR)
         c.setFont(FONT_MONO, FONT_SIZE)
         c.drawCentredString(PAGE_W / 2, self.y, label)
         self._draw_divider_segment(self.y + LINE_HEIGHT, 1)
         self.y -= LINE_HEIGHT
 
-    def _draw_side(self, x_col, text_x, text_w, tag, lno, text, n_rows, tint,
-                    star_tint, significant):
+    # -- function index (page 1) ------------------------------------------
+    def _toc_new_page(self, first=False):
+        if self.page_num > 0:
+            self.c.showPage()
+        self._bg_page()
         c = self.c
+        c.setFont(FONT_MONO_BOLD, 14)
+        c.setFillColorRGB(*CREAM)
+        c.drawString(MARGIN_L, PAGE_H - 30, "Function Index")
+        c.setFont(FONT_MONO, 8.5)
+        c.setFillColorRGB(*DIM_CREAM)
+        c.drawRightString(PAGE_W - MARGIN_R, PAGE_H - 30, f"page {self.page_num}")
+        if first:
+            c.drawString(MARGIN_L, PAGE_H - 44,
+                          f"{len(self.def_entries)} function definition(s) "
+                          f"\u2014 click a line number to jump")
+        c.setStrokeColorRGB(*ACCENT_LINE)
+        c.setLineWidth(0.6)
+        c.line(MARGIN_L, PAGE_H - 52, PAGE_W - MARGIN_R, PAGE_H - 52)
+
+        name_x = MARGIN_L
+        old_x = MARGIN_L + 360
+        new_x = old_x + 100
+        c.setFont(FONT_MONO_BOLD, 8.5)
+        c.setFillColorRGB(*DIM_CREAM)
+        c.drawString(name_x, PAGE_H - 66, "FUNCTION")
+        c.setFillColorRGB(*LIGHT_RED)
+        c.drawString(old_x, PAGE_H - 66, "OLD")
+        c.setFillColorRGB(*LIGHT_GREEN)
+        c.drawString(new_x, PAGE_H - 66, "NEW")
+
+        self.y = PAGE_H - 82
+        return name_x, old_x, new_x
+
+    def _draw_function_index(self):
+        c = self.c
+        c.bookmarkPage("toc_top")
+        c.addOutlineEntry("Function Index", "toc_top", level=0)
+
+        if self.def_entries:
+            name_x, old_x, new_x = self._toc_new_page(first=True)
+            row_h = 14
+            name_w = old_x - name_x - 10
+
+            for idx, entry in enumerate(self.def_entries):
+                if self.y < MARGIN_BOTTOM + row_h:
+                    name_x, old_x, new_x = self._toc_new_page(first=False)
+
+                if entry["old_lineno"] is None:
+                    name_color = LIGHT_GREEN     # added function
+                elif entry["new_lineno"] is None:
+                    name_color = LIGHT_RED       # removed function
+                else:
+                    name_color = CREAM
+
+                c.setFont(FONT_MONO, 8.6)
+                c.setFillColorRGB(*name_color)
+                c.drawString(name_x, self.y, truncate_to_width(
+                    entry["label"], FONT_MONO, 8.6, name_w))
+
+                outline_key = f"defnew{idx}" if entry["new_lineno"] else f"defold{idx}"
+                c.addOutlineEntry(entry["label"], outline_key, level=1)
+
+                for x, lineno, anchor, color in (
+                    (old_x, entry["old_lineno"], f"defold{idx}", LIGHT_RED),
+                    (new_x, entry["new_lineno"], f"defnew{idx}", LIGHT_GREEN),
+                ):
+                    if lineno:
+                        txt = str(lineno)
+                        c.setFillColorRGB(*color)
+                        c.drawString(x, self.y, txt)
+                        w = stringWidth(txt, FONT_MONO, 8.6)
+                        c.linkRect("", anchor, (x - 2, self.y - 2, x + w + 2, self.y + 9),
+                                   relative=0)
+                    else:
+                        c.setFillColorRGB(*DIM_CREAM)
+                        c.drawString(x, self.y, "\u2014")
+
+                self.y -= row_h
+
+        c.addOutlineEntry("Diff", "diff_top", level=0)
+
+    # -- diff row rendering -------------------------------------------------
+    def _draw_side(self, side, x_col, text_x, text_w, tag, lno, text, n_rows,
+                    tint, star_tint, significant, annotation):
+        c = self.c
+        anchor_map = self.old_def_anchor if side == "left" else self.new_def_anchor
+        if tag != "blank" and lno and lno in anchor_map:
+            c.bookmarkHorizontalAbsolute(anchor_map[lno], self.y + 9)
+
         if tag in ("delete", "insert"):
             bg = star_tint if (significant and self.highlight) else tint
             c.setFillColorRGB(*bg)
             c.rect(x_col - 3, self.y - (n_rows - 1) * LINE_HEIGHT - 2,
                    COL_W + 3, n_rows * LINE_HEIGHT, fill=1, stroke=0)
             if significant and self.highlight:
-                # a thin bright bar on the outer edge makes starred rows
-                # scannable even when skimming past the tint color
                 c.setFillColorRGB(*STAR_YELLOW)
-                edge_x = (x_col - 3) if x_col == LEFT_X else (x_col - 3 + COL_W + 3 - 2)
+                edge_x = (x_col - 3) if side == "left" else (x_col - 3 + COL_W + 3 - 2)
                 c.rect(edge_x, self.y - (n_rows - 1) * LINE_HEIGHT - 2, 2,
                        n_rows * LINE_HEIGHT, fill=1, stroke=0)
 
@@ -434,22 +677,34 @@ class SideBySideDiffPDF:
             c.drawString(text_x, yy, line)
             yy -= LINE_HEIGHT
 
-    def draw_pair(self, ltag, lno, ltext, rtag, rno, rtext, extra_patterns=None):
+        if annotation:
+            c.setFont(FONT_MONO, ANNOT_SIZE)
+            c.setFillColorRGB(*ANNOTATION_COLOR)
+            ann = truncate_to_width(f"\u2192 {annotation}", FONT_MONO, ANNOT_SIZE, text_w)
+            c.drawString(text_x, yy, ann)
+
+    def draw_pair(self, ltag, lno, ltext, rtag, rno, rtext):
         left_wrapped = wrap_text(ltext.rstrip("\n"), FONT_MONO, FONT_SIZE, LEFT_TEXT_W) \
             if ltag != "blank" else [""]
         right_wrapped = wrap_text(rtext.rstrip("\n"), FONT_MONO, FONT_SIZE, RIGHT_TEXT_W) \
             if rtag != "blank" else [""]
-        n_rows = max(len(left_wrapped), len(right_wrapped), 1)
+
+        l_sig = ltag == "delete" and is_significant(ltext, self.extra_patterns)
+        r_sig = rtag == "insert" and is_significant(rtext, self.extra_patterns)
+
+        ann_l = build_annotation(self.old_lines, self.old_scope_map, lno) if l_sig else None
+        ann_r = build_annotation(self.new_lines, self.new_scope_map, rno) if r_sig else None
+
+        left_total = len(left_wrapped) + (1 if ann_l else 0)
+        right_total = len(right_wrapped) + (1 if ann_r else 0)
+        n_rows = max(left_total, right_total, 1)
 
         self._ensure_space(n_rows)
 
-        l_sig = ltag == "delete" and is_significant(ltext, extra_patterns)
-        r_sig = rtag == "insert" and is_significant(rtext, extra_patterns)
-
-        self._draw_side(LEFT_X, LEFT_TEXT_X, LEFT_TEXT_W, ltag, lno, ltext, n_rows,
-                         TINT_RED, STAR_TINT_DEL, l_sig)
-        self._draw_side(RIGHT_X, RIGHT_TEXT_X, RIGHT_TEXT_W, rtag, rno, rtext, n_rows,
-                         TINT_GREEN, STAR_TINT_ADD, r_sig)
+        self._draw_side("left", LEFT_X, LEFT_TEXT_X, LEFT_TEXT_W, ltag, lno, ltext,
+                         n_rows, TINT_RED, STAR_TINT_DEL, l_sig, ann_l)
+        self._draw_side("right", RIGHT_X, RIGHT_TEXT_X, RIGHT_TEXT_W, rtag, rno, rtext,
+                         n_rows, TINT_GREEN, STAR_TINT_ADD, r_sig, ann_r)
         self._draw_divider_segment(self.y + LINE_HEIGHT, n_rows)
 
         self.y -= LINE_HEIGHT * n_rows
@@ -460,29 +715,94 @@ class SideBySideDiffPDF:
 
 
 # ---------------------------------------------------------------- #
+# Output path resolution
+# ---------------------------------------------------------------- #
+def resolve_output_path(explicit_output, old_file, new_file):
+    """
+    -o/--output always wins. Otherwise: if both source files live in the
+    same directory, save the PDF there. If they live in different
+    directories, there's no obvious "right" folder, so pop a native save
+    dialog and let the person choose. If no display is available (or the
+    dialog is dismissed), fall back to a terminal prompt, and if that
+    isn't interactive either, fall back to the current working directory.
+    """
+    if explicit_output:
+        return explicit_output
+
+    old_dir = old_file.resolve().parent
+    new_dir = new_file.resolve().parent
+    default_name = f"{old_file.stem}_vs_{new_file.stem}_diff.pdf"
+
+    if old_dir == new_dir:
+        return old_dir / default_name
+
+    print(f"note: {old_file.name} and {new_file.name} are in different "
+          f"directories ({old_dir} vs {new_dir}) \u2014 pick a save location.",
+          file=sys.stderr)
+
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        chosen = filedialog.asksaveasfilename(
+            title="Save diff PDF as...",
+            defaultextension=".pdf",
+            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
+            initialfile=default_name,
+            initialdir=str(old_dir),
+        )
+        root.destroy()
+        if chosen:
+            return Path(chosen)
+        print("note: save dialog was cancelled; falling back to a prompt.",
+              file=sys.stderr)
+    except Exception as e:
+        print(f"note: could not open a save dialog ({e}); falling back to a prompt.",
+              file=sys.stderr)
+
+    try:
+        typed = input(f"Save path for diff PDF [default: ./{default_name}]: ").strip()
+        if typed:
+            return Path(typed)
+    except (EOFError, KeyboardInterrupt):
+        print(file=sys.stderr)
+
+    fallback = Path.cwd() / default_name
+    print(f"note: using default location: {fallback}", file=sys.stderr)
+    return fallback
+
+
+# ---------------------------------------------------------------- #
 # Main
 # ---------------------------------------------------------------- #
 def main():
     ap = argparse.ArgumentParser(
         description="Render an intelligent (shift-aware) side-by-side diff "
-                    "of two Python files as a dark-mode PDF, with yellow-star "
-                    "highlighting for changes that affect calculations or plots."
+                    "of two Python files as a dark-mode PDF, with a "
+                    "hyperlinked function index and yellow-star highlighting "
+                    "for changes that affect calculations, data, or plots."
     )
     ap.add_argument("old_file", type=Path, help="Original / 'before' file")
     ap.add_argument("new_file", type=Path, help="Modified / 'after' file")
     ap.add_argument("-o", "--output", type=Path, default=None,
-                     help="Output PDF path (default: <old>_vs_<new>_diff.pdf)")
+                     help="Output PDF path. Default: saved alongside the "
+                          "source files if they share a directory; "
+                          "otherwise you'll be prompted (save dialog, "
+                          "falling back to a terminal prompt) to pick one.")
     ap.add_argument("--context", type=int, default=None,
                      help="Collapse unchanged runs longer than this many "
-                          "lines around each change (like diff -U).")
+                          "lines around each change (like diff -U). "
+                          "`def` lines are always kept regardless.")
     ap.add_argument("--no-highlight", action="store_true",
-                     help="Disable substantive-change star highlighting.")
+                     help="Disable substantive-change star highlighting "
+                          "(and its scope/call annotations).")
     ap.add_argument("--highlight-pattern", action="append", default=[],
                      metavar="REGEX",
                      help="Extra regex pattern (repeatable) that marks a "
                           "changed line as substantive, on top of the "
-                          "built-in numpy/pandas/scipy/sklearn/matplotlib/"
-                          "seaborn/plotly/arithmetic patterns.")
+                          "built-in patterns.")
     args = ap.parse_args()
 
     if not args.old_file.exists():
@@ -495,27 +815,34 @@ def main():
     old_lines = args.old_file.read_text(encoding="utf-8", errors="replace").splitlines()
     new_lines = args.new_file.read_text(encoding="utf-8", errors="replace").splitlines()
 
+    old_scope_map, old_defs = analyze_structure(old_lines)
+    new_scope_map, new_defs = analyze_structure(new_lines)
+    def_entries = build_def_index(old_lines, new_lines, old_defs, new_defs)
+
     pairs = compute_pairs(old_lines, new_lines)
     added, removed, unchanged, substantive = summarize(pairs, extra_patterns)
 
     if args.context is not None:
         pairs = apply_context(pairs, args.context)
 
-    out_path = args.output or Path(f"{args.old_file.stem}_vs_{args.new_file.stem}_diff.pdf")
+    out_path = resolve_output_path(args.output, args.old_file, args.new_file)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
     pdf = SideBySideDiffPDF(out_path, args.old_file.name, args.new_file.name,
                              added, removed, unchanged, substantive,
-                             highlight=not args.no_highlight)
+                             old_lines, new_lines, old_scope_map, new_scope_map,
+                             def_entries, highlight=not args.no_highlight,
+                             extra_patterns=extra_patterns)
 
     for ltag, lno, ltext, rtag, rno, rtext in pairs:
         if ltag == "gap":
             pdf.draw_gap(ltext)
         else:
-            pdf.draw_pair(ltag, lno, ltext, rtag, rno, rtext, extra_patterns)
+            pdf.draw_pair(ltag, lno, ltext, rtag, rno, rtext)
 
     pdf.save()
     print(f"Wrote {out_path}  (+{added} / -{removed} / ={unchanged} / "
-          f"\u2605{substantive} substantive)")
+          f"\u2605{substantive} substantive / {len(def_entries)} function(s) indexed)")
 
 
 if __name__ == "__main__":
